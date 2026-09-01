@@ -513,9 +513,7 @@ class NixlBaseConnectorWorker:
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         # Map of engine_id -> {(pp_rank, tp_rank): agent_name, ...}.
         # non-PP remote uses pp_rank 0, i.e. (0, tp_rank).
-        self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = defaultdict(
-            dict
-        )
+        self._remote_agents: dict[EngineId, dict[tuple[int, int], str]] = {}
         # Map of engine_id -> clock offset.
         self._engine_clock_offset: dict[EngineId, float] = {}
 
@@ -1940,14 +1938,16 @@ class NixlBaseConnectorWorker:
         """  # noqa: E501
         engine_id = nixl_agent_meta.engine_id
         # TODO re-evaluate refreshing for scaling/recovery
-        if (0, remote_tp_rank) in self._remote_agents.get(engine_id, {}):
+        with self._handshake_lock:
+            agents = self._remote_agents.get(engine_id, {})
+        if (agent_name := agents.get((0, remote_tp_rank))) is not None:
             logger.debug(
                 "Remote agent with engine_id %s and rank"
                 "%s already exchanged metadata, skip handshake.",
                 engine_id,
                 remote_tp_rank,
             )
-            return self._remote_agents[engine_id][(0, remote_tp_rank)]
+            return agent_name
 
         # Number of physical regions registered locally (one per layer/tensor).
         num_local_regions = len(self.block_len_per_layer)
@@ -2812,9 +2812,11 @@ class NixlBaseConnectorWorker:
             ):
                 continue  # handshake is still pending
 
+            with self._handshake_lock:
+                agents = self._remote_agents.get(engine_id, {})
             # Build the heartbeat message: "HB:req1,req2,..."
             hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
-            for agent_name in self._remote_agents[engine_id].values():
+            for agent_name in agents.values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
                 except Exception:
@@ -3157,12 +3159,19 @@ class NixlBaseConnectorWorker:
         all per-engine data structures. Used by both TTL eviction and
         shutdown.
         """
-        assert engine_id in self._remote_agents
+        # Pop both maps under one lock: a handshake completing in between
+        # would refill them and leave the engine connected but never evicted.
+        with self._handshake_lock:
+            agents = self._remote_agents.pop(engine_id, None)
+            last_active = self._engine_last_active.pop(engine_id, None)
+        if agents is None:
+            # Another thread reaped this engine first; nothing left to release.
+            return
 
         # Notif-only engines (push-mode D side) have no descriptor state.
         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
             self.nixl_wrapper.release_dlist_handle(handle)
-        for agent_name in self._remote_agents.pop(engine_id).values():
+        for agent_name in agents.values():
             self.nixl_wrapper.remove_remote_agent(agent_name)
 
         self.kv_caches_base_addr.pop(engine_id, None)
@@ -3177,9 +3186,7 @@ class NixlBaseConnectorWorker:
 
         # Drop the cached clock offset; it is re-measured on the next handshake.
         self._engine_clock_offset.pop(engine_id, None)
-        # A just-completed handshake may not have recorded activity yet, so
-        # tolerate a missing entry.
-        last_active = self._engine_last_active.pop(engine_id, None)
+        # A just-completed handshake may not have recorded activity yet.
         if log_eviction and last_active is not None:
             logger.info(
                 "Evicted stale remote engine %s (inactive for %.1fs).",

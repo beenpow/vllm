@@ -34,6 +34,7 @@ import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     PUSH_REG_NOTIF_PREFIX,
+    HeartbeatInfo,
     NixlAgentMetadata,
     NixlConnectorMetadata,
 )
@@ -356,6 +357,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w.world_size = 1
         w.engine_id = "test-decode-engine"
         w._remote_agents = {}
+        w._handshake_lock = threading.RLock()
         w._physical_blocks_per_logical_kv_block = 1
         w._uses_region_group_mapping = False
         w.region_group_ids = [0]
@@ -672,7 +674,6 @@ def _eviction_worker(engine_ttl: float) -> NixlPushConnectorWorker:
     w._engine_ttl = engine_ttl
     w._engine_last_active = {}
     w._engine_clock_offset = {}
-    w._handshake_lock = threading.RLock()
     # _cleanup_remote_engine touches these when reaping an engine.
     w.nixl_wrapper = MagicMock()
     w.dst_xfer_side_handles = {}
@@ -717,6 +718,92 @@ def test_stale_engine_evicted_on_push():
     assert "D-old" not in w._remote_agents
     assert "D-old" not in w._engine_last_active
     w.nixl_wrapper.remove_remote_agent.assert_called_once_with("agent-D-old")
+
+
+def test_reaping_an_already_reaped_engine_is_a_no_op():
+    """Both the engine main thread and ``nixl-push-writer`` reach
+    ``_evict_stale_engines`` through ``_ensure_handshake``, so two threads can
+    reap the same engine. The loser must not raise: it has nothing left to
+    release.
+    """
+    engine = "D-old"
+    w = _eviction_worker(engine_ttl=30.0)
+    w._remote_agents[engine] = {(0, 0): "agent-D-old"}
+    w._engine_last_active[engine] = time.perf_counter() - 10_000.0
+
+    w._cleanup_remote_engine(engine)
+    w._cleanup_remote_engine(engine)  # the other thread got here second
+
+    assert engine not in w._remote_agents
+    w.nixl_wrapper.remove_remote_agent.assert_called_once_with("agent-D-old")
+
+
+def test_reap_clears_liveness_left_behind_by_the_other_thread():
+    """``_do_start_push_kv`` refreshes ``_engine_last_active`` after
+    ``_ensure_handshake`` reports the engine connected. If the main thread
+    reaps in between, liveness is left without agents; the next reap must
+    clear it rather than return early and rescan it on every step."""
+    engine = "D-old"
+    w = _eviction_worker(engine_ttl=30.0)
+    w._engine_last_active[engine] = time.perf_counter() - 10_000.0
+
+    w._cleanup_remote_engine(engine)
+
+    assert engine not in w._engine_last_active
+    w.nixl_wrapper.remove_remote_agent.assert_not_called()
+
+
+def test_reap_racing_a_rehandshake_leaves_the_engine_evictable():
+    """``_cleanup_remote_engine`` releases the lock before touching NIXL. A
+    handshake for the same engine completing in that gap refills both
+    ``_remote_agents`` and ``_engine_last_active``; the reap must not then
+    drop the fresh liveness entry, or the engine stays connected but is never
+    evicted again."""
+    engine = "D-old"
+    w = _eviction_worker(engine_ttl=30.0)
+    w._remote_agents[engine] = {(0, 0): "agent-D-old"}
+    w._engine_last_active[engine] = time.perf_counter() - 10_000.0
+
+    def rehandshake_done(agent_name):
+        with w._handshake_lock:
+            w._remote_agents[engine] = {(0, 0): "agent-D-new"}
+            w._engine_last_active[engine] = time.perf_counter()
+
+    w.nixl_wrapper.remove_remote_agent.side_effect = rehandshake_done
+
+    w._cleanup_remote_engine(engine)
+
+    assert w._remote_agents[engine] == {(0, 0): "agent-D-new"}
+    assert engine in w._engine_last_active
+
+
+def test_heartbeat_does_not_resurrect_a_reaped_engine():
+    """A remote reaped after the handshake check must stay gone.
+
+    ``_remote_agents`` auto-creates on lookup, so re-adding an empty entry
+    marks the engine connected forever: ``_ensure_handshake`` then never
+    reconnects it and every later push to it fails.
+    """
+    engine = "P-engine"
+    w = _eviction_worker(engine_ttl=3600.0)
+    # Mirrors the base worker's auto-creating declaration.
+    w._remote_agents = defaultdict(dict, {engine: {(0, 0): "agent-P"}})
+    w._hb_handshake_notif_only = True
+
+    def reap_after_check(engine_id, *args, **kwargs):
+        w._remote_agents.pop(engine_id, None)
+        return None  # caller has already been told the handshake is done
+
+    w._ensure_handshake = reap_after_check
+
+    meta = NixlConnectorMetadata()
+    meta.heartbeat_by_engine = {
+        engine: HeartbeatInfo(req_ids={"req"}, host="h", port=1, tp_size=1)
+    }
+    w._send_heartbeats(meta)
+
+    assert engine not in w._remote_agents
+    w.nixl_wrapper.send_notif.assert_not_called()
 
 
 class TestPushWriterNotifs:
